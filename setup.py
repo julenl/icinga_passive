@@ -7,7 +7,7 @@ with open("README.md", "r") as fh:
 
 setup(
     name = 'icinga_passive',
-    version = '1.0.0.dev1',
+    version = '1.0.1.dev1',
     description = 'Tool to send monitoring metrics pasively to Icinga2',
     long_description = long_description,
     long_description_content_type="text/markdown",

@@ -1,4 +1,4 @@
-#! /usr/bin/env python
+#! /usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
 # Copyright (C) 2020, Julen Larrucea <code@larrucea.eu>
@@ -20,9 +20,6 @@ import os
 import socket
 import requests
 import subprocess
-
-# For parsing the permissions HTML
-from lxml import html
 
 # Trick to suppress requests's warning for unverified https
 import urllib3
@@ -47,9 +44,6 @@ def ssl_context():
 hostname = socket.gethostname()
 # We probably just want the short hostname
 hostname = hostname.split('.')[0]
-hostname = 'rasplex'
-
-service_name = 'TEST service'
 
 
 # Try to read API credentials from .icinga_api_creds or prompt the user
@@ -122,9 +116,10 @@ def run_cmd(cmd, verbose=False):
 # hostname and service_name must be configured already in Icinga2
 # the command is an arbitrary command to execture in the current system
 # warn and crit is warning and critical threshold
-def build_data(hostname, service, command, uom='', warn=None, crit=None):
+def build_data(hostname, service, command, uom='', warn='', crit=''):
     data = {}
     sservice = service.replace(' ', '_')
+    #sservice = service.split()[1]
     data['type'] = 'Service'
     data['filter'] = 'host.name=="' + hostname + '" && service.name=="'
     data['filter'] += service + '"'
@@ -136,12 +131,26 @@ def build_data(hostname, service, command, uom='', warn=None, crit=None):
         return data
 
     res = run_cmd(command)
-    if res['rc'] == 0:
+
+    # If the command name starts with "check_" assume we are using some icinga
+    # icinga plugin, so the stdout is probably alredy properly formatted and 
+    # ready to be sent
+    if os.path.basename(command).startswith('check_'):
+        data['exit_status'] = res['rc']
+        data['plugin_output'] = res['stdout']
+
+    else:    
+        # If the command exited with error do not go any further
+        if res['rc'] != 0:
+            data['exit_status'] = 3
+            data['plugin_output'] = '[UNKNOWN] Command exited with error'
+            return data
+
+        # For arbitrary commands we assume an int or float as output
         try:
             fldig = float(res['stdout'])
-            indig = int(res['stdout'])
-            if fldig == indig:
-                stdout = indig
+            if int(fldig) / fldig == 1:
+                stdout = int(fldig)
             else:
                 stdout = fldig
         except ValueError as e:
@@ -149,7 +158,6 @@ def build_data(hostname, service, command, uom='', warn=None, crit=None):
             msg += '" to a number'
             data['exit_status'] = 3
             data['plugin_output'] = msg
-            print("DATA", data)
             return data
 
         if crit and stdout > crit:
@@ -163,14 +171,17 @@ def build_data(hostname, service, command, uom='', warn=None, crit=None):
             data['exit_status'] = 1
             data['plugin_output'] = msg
         else:
-            msg = sservice + ' OK - The value of "' + service + '" is "'
-            msg += str(stdout) + '"|' + sservice + '=' + str(stdout) + uom
+            msg = sservice + '[OK] - ' + service + ': ' + str(stdout) 
+            #msg += str(stdout) + " | '" + sservice + "'=" + str(stdout) + uom
+            #msg += str(stdout) + " | 'data'=" + str(stdout) + uom
+            #msg += ';' + warn + ';' + crit +';;'
+            #msg = 'TEMPERATURE OK - Core 0 has temperature: +63 | Core 0:63;65;75'
             data['exit_status'] = 0
             data['plugin_output'] = msg
-
-    else:
-        data['exit_status'] = 3
-        data['plugin_output'] = '[UNKNOWN] Command exited with error'
+            msg = "'" + sservice + "'=" + str(stdout) + uom
+            msg += ';' + warn + ';' + crit +';;'
+            data['performance_data'] = msg 
+            data['check_source'] = hostname
 
     return data
 
@@ -181,6 +192,9 @@ def api_req(api_path):
     try:
         rdict = r.json()
     except ValueError as e:
+        # For parsing the permissions HTML
+        from lxml import html
+
         # print('INFO: The api request received an HTML response')
         tree = html.fromstring(r.text)
         username = tree.xpath('//b/text()')[0]
@@ -321,10 +335,10 @@ def main():
                         help='Command to retrieve the results from')
     parser.add_argument('-u', '--uom', choices=['','s','%','B','c'], default='',
                         help='Unit Of Measurement for Nagios compatible metrics')
-    parser.add_argument('--warn',
+    parser.add_argument('--warn', default='',
                         help='Return "Warning" if response is above this '
                              'value')
-    parser.add_argument('--crit',
+    parser.add_argument('--crit', default='',
                         help='Return "Critical" if response is above this ' +
                              'value')
     if presets_loaded:
@@ -343,6 +357,7 @@ def main():
     hostname = args.host or socket.gethostname().split('.')[0]
 
     command = ''
+    uom = ''
     if presets_loaded:
         presets = get_presets()
         if args.list_presets:
