@@ -1,4 +1,4 @@
-#! /usr/bin/env python3
+#! /usr/bin/env python
 # -*- coding: utf-8 -*-
 #
 # Copyright (C) 2020, Julen Larrucea <code@larrucea.eu>
@@ -10,20 +10,56 @@
 """
 This tool executes a command from the shell and send the output as a
 "passive" check for the given host and service into the Icinga2 API.
-It should work in both Python2 and Python3.
+It is written as a poligloth, so it should work in both Python2 and Python3.
+It is written in a slightly trickier way to use only modules in the standard
+python library.
 """
 
-import json
+import os
 import ssl
 import sys
-import os
+import json
 import socket
-import requests
+import base64
+import platform
 import subprocess
 
-# Trick to suppress requests's warning for unverified https
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# Import the functions with the same name to be able to use them
+# regardles of the python version
+python_version = platform.python_version().split('.')[0]
+if python_version == '3':
+    from urllib.request import Request, urlopen
+elif python_version == '2':
+    from urllib2 import Request, urlopen
+else:
+    print('ERROR: The current Python version is not supported.')
+    print('It is neither 2 nor 3!')
+    sys.exit(1)
+
+
+# Do not verify SSL context (probably Icinga2 has a self-signed certificate)
+if (not os.environ.get('PYTHONHTTPSVERIFY', '') and 
+  getattr(ssl, '_create_unverified_context', None)):
+    ssl._create_default_https_context = ssl._create_unverified_context
+
+
+#debug = True
+#if debug:
+#    import logging
+#    try:
+#       import http.client as http_client
+#    except ImportError:
+#        # Python 2
+#        import httplib as http_client
+#    http_client.HTTPConnection.debuglevel = 1
+#    
+#    # You must initialize logging, otherwise you'll not see debug output.
+#    logging.basicConfig()
+#    logging.getLogger().setLevel(logging.DEBUG)
+#    requests_log = logging.getLogger("requests.packages.urllib3")
+#    requests_log.setLevel(logging.DEBUG)
+#    requests_log.propagate = True
+
 
 try:
     from lib_presets import get_presets
@@ -42,7 +78,7 @@ def ssl_context():
 
 
 hostname = socket.gethostname()
-# We probably just want the short hostname
+# We probably just want the short hostname instead of the FQDN
 hostname = hostname.split('.')[0]
 
 
@@ -75,9 +111,17 @@ def load_creds():
 
 
 creds = load_creds()
-auth = (creds['username'], creds['password'])
-icinga_master = creds['endpoint']
+username = creds['username']
+password = creds['password']
+endpoint = creds['endpoint']
 
+# Python3 requires the auth pair to be in bytes and python2 as string
+auth_pair = username + ':' + password
+if python_version == '3':
+    auth_pair = str.encode(auth_pair)
+auth = base64.b64encode(auth_pair)
+if python_version == '3':
+    auth = auth.decode('utf-8')
 
 # Run a (shell) command and return stdout (list of lines) and RC as a dict
 # cmd is a string or a list of elements
@@ -119,10 +163,10 @@ def run_cmd(cmd, verbose=False):
 def build_data(hostname, service, command, uom='', warn='', crit=''):
     data = {}
     sservice = service.replace(' ', '_')
-    #sservice = service.split()[1]
     data['type'] = 'Service'
     data['filter'] = 'host.name=="' + hostname + '" && service.name=="'
     data['filter'] += service + '"'
+    data['check_source'] = hostname
 
     # If no command given, we are probably testing the setup
     if not command:
@@ -137,7 +181,10 @@ def build_data(hostname, service, command, uom='', warn='', crit=''):
     # ready to be sent
     if os.path.basename(command).startswith('check_'):
         data['exit_status'] = res['rc']
-        data['plugin_output'] = res['stdout']
+        stdout = res['stdout']
+        data['plugin_output'] = stdout.split('|')[0]
+        if '|' in stdout:
+            data['performance_data'] = stdout.split('|')[1]
 
     else:    
         # If the command exited with error do not go any further
@@ -171,38 +218,70 @@ def build_data(hostname, service, command, uom='', warn='', crit=''):
             data['exit_status'] = 1
             data['plugin_output'] = msg
         else:
-            msg = sservice + '[OK] - ' + service + ': ' + str(stdout) 
-            #msg += str(stdout) + " | '" + sservice + "'=" + str(stdout) + uom
-            #msg += str(stdout) + " | 'data'=" + str(stdout) + uom
-            #msg += ';' + warn + ';' + crit +';;'
-            #msg = 'TEMPERATURE OK - Core 0 has temperature: +63 | Core 0:63;65;75'
+            msg = sservice + ' [OK] - ' + service + ': ' + str(stdout) 
             data['exit_status'] = 0
             data['plugin_output'] = msg
             msg = "'" + sservice + "'=" + str(stdout) + uom
             msg += ';' + warn + ';' + crit +';;'
             data['performance_data'] = msg 
-            data['check_source'] = hostname
 
     return data
 
 
-def api_req(api_path):
-    req_url = icinga_master + api_path
-    r = requests.get(req_url, auth=auth, verify=False)
-    try:
-        rdict = r.json()
-    except ValueError as e:
-        # For parsing the permissions HTML
-        from lxml import html
+# Parse the API username and permissions from the HTML response
+def parse_perms(html):
+    user = html.split('<b>')[1].split('</b>')[0]
+    perm = html.split('<ul>')[1].split('</ul>')[0].split('<li>')
+    perm = [ p.replace('</li>', '') for p in perm if p ]
+    if username:
+        return {'username': user, 'permissions': perm}
 
-        # print('INFO: The api request received an HTML response')
-        tree = html.fromstring(r.text)
-        username = tree.xpath('//b/text()')[0]
-        perm = tree.xpath('//li/text()')
-        if username and perm:
-            return {'username': username, 'permissions': perm}
-        else:
-            return r.text
+
+# Make an API request to the given path
+# If data (dict) is provided, it will be a POST request
+def api_req(api_path, data=None, verbose=False):
+    # Escape posible spaces or '!' characters in the api_path and GET variables
+    if ' ' in api_path:
+        api_path = api_path.replace(' ', '%20')
+    if '!' in api_path:
+        api_path = api_path.replace('!', '%21')
+    req_url = endpoint + api_path
+
+    if data:
+        data = json.dumps(data)
+        # In Python3 the data has to be of type "bytes"
+        if python_version == '3':
+            data = data.encode('utf-8')
+
+    r = Request(url = req_url, data=data)
+
+    r.add_header("Authorization", "Basic %s" % auth)  
+    if data:
+        r.add_header("Content-Type", "application/json")  
+        r.add_header("Accept", "application/json")  
+
+    if verbose:
+        print('Sending the following request:')
+        print('URL: ' + req_url)
+        print('HTTP-Headers: ' + json.dumps(r.headers, indent=4))
+        if data:
+            print('Data: ', r.data)
+
+    result = urlopen(r)
+    res = result.read()
+    if type(res) == bytes:
+        res = res.decode('utf-8')
+
+    if verbose:
+        print('Result received')
+
+    # If something went wrong or unexpected, tell me more
+    try:
+        rdict = json.loads(res)
+    except ValueError as e:
+        data = parse_perms(res)
+        if data:
+            return data
 
     if 'results' in rdict and rdict['results']:
         return rdict['results']
@@ -210,12 +289,11 @@ def api_req(api_path):
         print('\nERROR: no objects found on path:')
         print(api_path)
         return []
-        # sys.exit(1)
     else:
         print('\nERROR: something went wrong at API path:')
         print(api_path)
         print('Error message:', rdict)
-        sys.exit(1)
+        sys.exit(1)    
 
 
 # Take a full permission string and return a list of (broader) permissions
@@ -231,13 +309,11 @@ def propagate_perm(perm):
 # print(propagate_perm('objects/query/Host'))
 
 
-def run_test(hostname, service, data):
-    header = {'Content-type': 'application/json', 'Accept': 'application/json'}
-
+def run_test(hostname, service, data, verbose=False):
     # print('Check user permissions at the Icinga2 API:', end=' ')
     print('Check user permissions at the Icinga2 API:')
     # req_permissions = ['actions/process-check-result', 'actions/*', '*']
-    res = api_req('/v1')
+    res = api_req('/v1', verbose=verbose)
     if 'username' in res and 'permissions' in res and res['permissions']:
         user, perm = res['username'], res['permissions']
     else:
@@ -259,7 +335,7 @@ def run_test(hostname, service, data):
         # print('Check if host "' + hostname + '" exists in Icinga:', end=' ')
         print('Check if host "' + hostname + '" exists in Icinga2:')
         req_url = '/v1/objects/hosts?hosts=' + hostname + ''
-        res = api_req(req_url)
+        res = api_req(req_url, verbose=verbose)
         if res:
             print('OK')
         else:
@@ -278,7 +354,10 @@ def run_test(hostname, service, data):
         req_url = '/v1/objects/services?service=' + hostname + '!'
         req_url += service
 
-        res = api_req(req_url)
+        if verbose:
+            print("Request URL: " + req_url)
+
+        res = api_req(req_url, verbose=verbose)
         if res:
             print('OK')
         else:
@@ -300,25 +379,15 @@ def run_test(hostname, service, data):
 
 
 def push_data(data, verbose=False):
-    header = {'Content-type': 'application/json', 'Accept': 'application/json'}
-    req_url = icinga_master + '/v1/actions/process-check-result'
-    datastr = json.dumps(data)
     if verbose:
         print('# Sending the following data to the Icinga API:')
         print(json.dumps(data, indent=4))
         print('')
         print('# Message for Icinga2:')
         print(data['plugin_output'])
-    r = requests.post(req_url,
-                      auth=auth,
-                      headers=header,
-                      json=data,
-                      verify=False)
 
-    if verbose:
-        print('')
-        print('# Response from the Icinga2 API:')
-        print(json.dumps(json.loads(r.text), indent=4))
+    api_path = '/v1/actions/process-check-result'
+    api_req(api_path, data, verbose)
 
 
 def main():
@@ -408,7 +477,7 @@ def main():
                       )
 
     if args.test:
-        run_test(hostname, args.service, data)
+        run_test(hostname, args.service, data, verbose= args.verbose)
         sys.exit(0)
 
     push_data(data=data, verbose=args.verbose)
